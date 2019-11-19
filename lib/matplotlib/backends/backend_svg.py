@@ -848,15 +848,16 @@ class RendererSVG(RendererBase):
                 x2=short_float_fmt(xb), y2=short_float_fmt(yb))
             writer.element(
                 'stop',
+                offset='0',
+                style=_generate_css({
+                    'stop-color': rgb2hex(rgba_color),
+                    'stop-opacity': "0"}))
+            writer.element(
+                'stop',
                 offset='1',
                 style=_generate_css({
                     'stop-color': rgb2hex(avg_color),
                     'stop-opacity': short_float_fmt(rgba_color[-1])}))
-            writer.element(
-                'stop',
-                offset='0',
-                style=_generate_css({'stop-color': rgb2hex(rgba_color),
-                                    'stop-opacity': "0"}))
 
             writer.end('linearGradient')
 
