@@ -808,8 +808,7 @@ class RendererSVG(RendererBase):
             writer.element(
                 'feColorMatrix',
                 attrib={'type': 'matrix'},
-                values='1 0 0 0 0 \n0 1 0 0 0 \n0 0 1 0 0' +
-                       ' \n1 1 1 1 0 \n0 0 0 0 1 ')
+                values='1 0 0 0 0\n0 1 0 0 0\n0 0 1 0 0\n1 1 1 1 0')
             writer.end('filter')
 
         avg_color = np.average(colors, axis=0)
