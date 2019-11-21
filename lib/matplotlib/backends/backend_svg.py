@@ -301,6 +301,7 @@ class RendererSVG(RendererBase):
         self._path_collection_id = 0
         self._hatchd = {}
         self._has_gouraud = False
+        self._filter_compat = False
         self._n_gradients = 0
 
         super().__init__()
@@ -315,7 +316,8 @@ class RendererSVG(RendererBase):
             viewBox='0 0 %s %s' % (str_width, str_height),
             xmlns="http://www.w3.org/2000/svg",
             version="1.1",
-            attrib={'xmlns:xlink': "http://www.w3.org/1999/xlink"})
+            attrib={'xmlns:xlink': "http://www.w3.org/1999/xlink",
+                    'xmlns:a': "http://ns.adobe.com/AdobeSVGViewerExtensions/3.0/"})
         self._write_metadata(metadata)
         self._write_default_style()
 
@@ -775,132 +777,180 @@ class RendererSVG(RendererBase):
         self._path_collection_id += 1
 
     def draw_gouraud_triangle(self, gc, points, colors, trans):
-        # docstring inherited
-
-        # This uses a method described here:
-        #
-        #   http://www.svgopen.org/2005/papers/Converting3DFaceToSVG/index.html
-        #
-        # that uses three overlapping linear gradients to simulate a
-        # Gouraud triangle.  Each gradient goes from fully opaque in
-        # one corner to fully transparent along the opposite edge.
-        # The line between the stop points is perpendicular to the
-        # opposite edge.  Underlying these three gradients is a solid
-        # triangle whose color is the average of all three points.
-
         writer = self.writer
         if not self._has_gouraud:
             self._has_gouraud = True
-            writer.start(
-                'filter',
-                id='colorAdd')
-            writer.element(
-                'feComposite',
-                attrib={'in': 'SourceGraphic'},
-                in2='BackgroundImage',
-                operator='arithmetic',
-                k2="1", k3="1")
-            writer.end('filter')
-            # feColorMatrix filter to correct opacity
-            writer.start(
-                'filter',
-                id='colorMat')
-            writer.element(
-                'feColorMatrix',
-                attrib={'type': 'matrix'},
-                values='1 0 0 0 0\n0 1 0 0 0\n0 0 1 0 0\n1 1 1 1 0')
-            writer.end('filter')
+            if self._filter_compat:
+                writer.start('filter', id="lighten")
+                writer.element(
+                    'feBlend',
+                    mode="lighten",
+                    in2="BackgroundImage")
+                writer.end('filter')
 
+        # Skip fully-transparent triangles
         avg_color = np.average(colors, axis=0)
         if avg_color[-1] == 0:
-            # Skip fully-transparent triangles
             return
 
         trans_and_flip = self._make_flip_transform(trans)
         tpoints = trans_and_flip.transform(points)
+        
+        # Skip zero-area triangles (co-linear points)
+        if np.allclose(0.0, np.cross(tpoints[1] - tpoints[0],
+                                     tpoints[2] - tpoints[0])):
+            return
 
+        centroid = np.mean(tpoints, axis=-2)
+
+        # Triangle formation using <path>. To avoid tiny gaps,
+        # expand the triangle corners a little bit.
+        dpath = ""
+        for pt in tpoints:
+            dpath += "L" if dpath else "M"
+            pt = centroid + 1.005 * (pt-centroid)
+            dpath += short_float_fmt(pt[0]) + " "
+            dpath += short_float_fmt(pt[1])
+        dpath += "Z"
+
+        writer.start('g')
         writer.start('defs')
-        for i in range(3):
-            x1, y1 = tpoints[i]
-            x2, y2 = tpoints[(i + 1) % 3]
-            x3, y3 = tpoints[(i + 2) % 3]
-            rgba_color = colors[i]
 
-            if x2 == x3:
-                xb = x2
-                yb = y1
-            elif y2 == y3:
-                xb = x1
-                yb = y2
-            else:
-                m1 = (y2 - y3) / (x2 - x3)
-                b1 = y2 - (m1 * x2)
-                m2 = -(1.0 / m1)
-                b2 = y1 - (m2 * x1)
-                xb = (-b1 + b2) / (m1 - m2)
-                yb = m2 * xb + b2
+        for ch in range(colors.shape[-1]):
+            # No gradient for channels with uniform color
+            if np.allclose(colors[:, ch], colors[0, ch]):
+                continue
+            
+            # Compute gradient vector by considering the triangle
+            # as if suspended in (x,y,c)-space with c the value of
+            # the color channel.
+            tpoints_values = np.column_stack([tpoints, colors[:, ch]])
+            
+            # The direction of the gradient (the slope with largest
+            # increasing c) is perpendicular to the normal and the
+            # contour lines, which are themselves perpendicular to
+            # the normal and the up/+c direction (0,0,1).
+            normal = np.cross(tpoints_values[1] - tpoints_values[0],
+                              tpoints_values[2] - tpoints_values[0])
+            gradient = np.cross(np.cross(normal, [0,0,1]), normal)
 
+            # Normalize the gradient vector such that it connects
+            # a point with c=0.0 at one end and c=1.0 at the other.
+            gradient = gradient[:2] / gradient[2]
+            
+            # Offset forward and backward from a point with a known
+            # value (the centroid having avg_color) along the gradient
+            pt1 = centroid - gradient * avg_color[ch]
+            pt2 = centroid + gradient * (1 - avg_color[ch])
+            
             writer.start(
                 'linearGradient',
-                id="GR%x_%d" % (self._n_gradients, i),
+                id="GR%x_%c" % (self._n_gradients, "RGBA"[ch]),
                 gradientUnits="userSpaceOnUse",
-                x1=short_float_fmt(x1), y1=short_float_fmt(y1),
-                x2=short_float_fmt(xb), y2=short_float_fmt(yb))
+                x1=short_float_fmt(pt1[0]), y1=short_float_fmt(pt1[1]),
+                x2=short_float_fmt(pt2[0]), y2=short_float_fmt(pt2[1]))
+            end_color = ("#f00", "#0f0", "#00f", "#fff")[ch]
             writer.element(
                 'stop',
                 offset='0',
-                style=_generate_css({
-                    'stop-color': rgb2hex(rgba_color),
-                    'stop-opacity': "0"}))
+                style=_generate_css({'stop-color': "#000"}))
             writer.element(
                 'stop',
                 offset='1',
-                style=_generate_css({
-                    'stop-color': rgb2hex(avg_color),
-                    'stop-opacity': short_float_fmt(rgba_color[-1])}))
-
+                style=_generate_css({'stop-color': end_color}))
             writer.end('linearGradient')
 
+        if avg_color[-1] != 1.0:
+            mask = "M%x" % self._n_gradients
+            
+            if np.allclose(colors[:, -1], colors[0, -1]):
+                fill = rgb2hex([colors[0, -1]] * 3)
+            else:
+                fill = "url(#GR%x_A)" % self._n_gradients
+
+            writer.start('mask', id=mask)            
+            writer.element(
+                'path',
+                d=dpath,
+                fill=fill,
+                attrib={'shape-rendering': "crispEdges"})
+            writer.end('mask')
+        else:
+            mask = None
+
         writer.end('defs')
+        
+        if mask:
+            writer.start('g', mask="url(#%s)" % mask)
+        
+        # writer.start(
+        #     'g',
+        #     style=_generate_css({'isolation': "isolate"}),
+        #     attrib={'enable-background': "new",
+        #             'a:adobe-isolated': "true",
+        #             'shape-rendering': "crispEdges"})
 
-        # triangle formation using "path"
-        dpath = "M " + short_float_fmt(x1)+',' + short_float_fmt(y1)
-        dpath += " L " + short_float_fmt(x2) + ',' + short_float_fmt(y2)
-        dpath += " " + short_float_fmt(x3) + ',' + short_float_fmt(y3) + " Z"
+        writer.start('g', attrib={'shape-rendering': "crispEdges"})
+        
+        bottom_layer = True
 
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': rgb2hex(avg_color),
-                    'fill-opacity': '1',
-                    'shape-rendering': "crispEdges"})
-
-        writer.start(
-                'g',
-                attrib={'stroke': "none",
-                        'stroke-width': "0",
-                        'shape-rendering': "crispEdges",
-                        'filter': "url(#colorMat)"})
-
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': 'url(#GR%x_0)' % self._n_gradients,
-                    'shape-rendering': "crispEdges"})
-
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': 'url(#GR%x_1)' % self._n_gradients,
-                    'filter': 'url(#colorAdd)',
-                    'shape-rendering': "crispEdges"})
-
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': 'url(#GR%x_2)' % self._n_gradients,
-                    'filter': 'url(#colorAdd)',
-                    'shape-rendering': "crispEdges"})
+        # Combine uniform color channels into a single first layer
+        uniform_color = [0.0, 0.0, 0.0]
+        for ch in range(3):
+            if np.allclose(colors[:, ch], colors[0, ch]):
+                uniform_color[ch] = colors[0, ch]
+                bottom_layer = False
+        if not bottom_layer:
+            writer.element(
+                'path',
+                d=dpath,
+                fill=rgb2hex(uniform_color),
+                attrib={'shape-rendering': "crispEdges"})
+        
+        # Add gradient channel layers
+        for ch in range(3):
+            if np.allclose(colors[:, ch], colors[0, ch]):
+                continue
+            fill = "url(#GR%x_%c)" % (self._n_gradients, "RGB"[ch])
+            if bottom_layer:
+                # Bottom layer doesn't have blending
+                writer.element(
+                    'path',
+                    d=dpath,
+                    fill=fill,
+                    attrib={'shape-rendering': "crispEdges"})
+                bottom_layer = False
+            else:
+                if not self._filter_compat:
+                    # Use fast CSS mix-blend-mode (enabled by default).
+                    # Supported: Firefox, Chrome, Inkscape, Illustrator
+                    # No support: Edge, IE, Batik, ImageMagick, GIMP, more?
+                    writer.element(
+                        'path',
+                        d=dpath,
+                        fill=fill,
+                        style=_generate_css({'mix-blend-mode': "lighten"}),
+                        attrib={'shape-rendering': "crispEdges",
+                                'a:adobe-blending-mode': "lighten"})
+                else:
+                    # Use SVG built-in <filter> for blending.
+                    # Adds support for ImageMagick, Batik and GIMP
+                    # Breaks: Firefox, adds artifacting in Illustrator
+                    writer.start(
+                        'g',
+                        style=_generate_css({'mix-blend-mode': "lighten"}),
+                        attrib={'a:adobe-blending-mode': "lighten"})
+                    writer.element(
+                        'path',
+                        d=dpath,
+                        fill=fill,
+                        filter="url(#lighten)",
+                        attrib={'shape-rendering': "crispEdges"})
+                    writer.end('g')
+        writer.end('g')
+        
+        if mask:
+            writer.end('g')
 
         writer.end('g')
 
